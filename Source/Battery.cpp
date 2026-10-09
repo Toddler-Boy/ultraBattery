@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <array>
 #include <optional>
-#include <string_view>
 
 #include <windows.h>
 
@@ -14,6 +13,7 @@
 #include <devpkey.h>
 
 #include "Battery.h"
+#include "Text.h"
 
 //-----------------------------------------------------------------------------
 
@@ -25,28 +25,50 @@ namespace
 	// Undocumented, the Bluetooth stack's live link state (the battery level stays cached after a disconnect)
 	DEFINE_DEVPROPKEY ( connectedKey, 0x83DA6326, 0x97A6, 0x4088, 0x94, 0x53, 0xA1, 0x92, 0x3F, 0x57, 0x3B, 0x29, 15 );
 
-	std::vector<wchar_t> idList ( const wchar_t* enumerator )
-	{
-		constexpr auto	flags = ULONG ( CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT );
-
-		auto	list = std::vector<wchar_t> {};
-		for ( auto result = CONFIGRET ( CR_BUFFER_SMALL ); result == CR_BUFFER_SMALL; )
-		{
-			auto	length = ULONG ( 0 );
-			if ( CM_Get_Device_ID_List_SizeW ( &length, enumerator, flags ) != CR_SUCCESS )
-				return {};
-
-			list.resize ( length );
-			result = CM_Get_Device_ID_ListW ( enumerator, list.data (), length, flags );
-			if ( result != CR_SUCCESS && result != CR_BUFFER_SMALL )
-				return {};
-		}
-
-		return list;
-	}
-
 	auto	radio = HANDLE ( nullptr );
 	auto	radioNotification = HDEVNOTIFY ( nullptr );
+
+	// The present device IDs of one enumerator as a REG_MULTI_SZ style list; ids == nullptr = none
+	struct IdList
+	{
+		wchar_t*	ids = nullptr;
+
+		explicit IdList ( const wchar_t* enumerator )
+		{
+			constexpr auto	flags = ULONG ( CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT );
+
+			for ( ;; )
+			{
+				auto	length = ULONG ( 0 );
+				if ( CM_Get_Device_ID_List_SizeW ( &length, enumerator, flags ) != CR_SUCCESS )
+					return;
+
+				ids = static_cast<wchar_t*> ( HeapAlloc ( GetProcessHeap (), 0, length * sizeof ( wchar_t ) ) );
+				if ( ids == nullptr )
+					return;
+
+				const auto	result = CM_Get_Device_ID_ListW ( enumerator, ids, length, flags );
+				if ( result == CR_SUCCESS )
+					return;
+
+				release ();
+				if ( result != CR_BUFFER_SMALL )
+					return;
+			}
+		}
+
+		~IdList () { release (); }
+
+		IdList ( const IdList& ) = delete;
+		IdList& operator= ( const IdList& ) = delete;
+
+		void release ()
+		{
+			if ( ids != nullptr )
+				HeapFree ( GetProcessHeap (), 0, ids );
+			ids = nullptr;
+		}
+	};
 
 	template <typename T>
 	bool property ( DEVINST node, const DEVPROPKEY& key, DEVPROPTYPE wanted, T& value )
@@ -54,20 +76,11 @@ namespace
 		auto	type = DEVPROPTYPE ( 0 );
 		auto	size = ULONG ( sizeof ( value ) );
 
-		// Text buffers keep two zeroed wchar_t at the end, so a full string list stays double-terminated
+		// Zeroed text buffers keep two wchar_t spare, so a full string list stays double-terminated
 		if constexpr ( requires { value.data (); } )
 			size -= sizeof ( wchar_t ) * 2;
 
 		return CM_Get_DevNode_PropertyW ( node, &key, &type, reinterpret_cast<PBYTE> ( &value ), &size, 0 ) == CR_SUCCESS && type == wanted;
-	}
-
-	// A REG_MULTI_SZ style list: strings separated by one zero, ended by two
-	std::vector<std::wstring_view> strings ( const wchar_t* list )
-	{
-		auto	result = std::vector<std::wstring_view> {};
-		for ( const auto* text = list; text != nullptr && *text != 0; text += result.back ().size () + 1 )
-			result.emplace_back ( text );
-		return result;
 	}
 
 	std::optional<int> batteryLevel ( DEVINST node )
@@ -87,11 +100,15 @@ namespace
 
 	bool hasHardwareId ( DEVINST node, const wchar_t* wanted )
 	{
-		auto	ids = std::array<wchar_t, 2048> {};
+		auto	ids = std::array<wchar_t, 1024> {};
 		if ( ! property ( node, DEVPKEY_Device_HardwareIds, DEVPROP_TYPE_STRING_LIST, ids ) )
 			return false;
 
-		return std::ranges::any_of ( strings ( ids.data () ), [ & ] ( std::wstring_view id ) { return _wcsicmp ( id.data (), wanted ) == 0; } );
+		for ( const auto* id = ids.data (); *id != 0; id = text::next ( id ) )
+			if ( text::equals ( id, wanted, true ) )
+				return true;
+
+		return false;
 	}
 
 	// The HID collections sit two levels down (BTHLE device, GATT HID service, HID collection)
@@ -112,32 +129,23 @@ namespace
 		if ( hasDescendantWithHardwareId ( node, L"HID_DEVICE_SYSTEM_GAME", 2 ) )
 			return battery::Kind::gamepad;
 
-		auto	categories = std::array<wchar_t, 512> {};
+		auto	categories = std::array<wchar_t, 256> {};
 		if ( ! property ( node, DEVPKEY_DeviceContainer_Category, DEVPROP_TYPE_STRING_LIST, categories ) )
 			return std::nullopt;
 
-		for ( const auto category : strings ( categories.data () ) )
+		for ( const auto* category = categories.data (); *category != 0; category = text::next ( category ) )
 		{
-			if ( category == L"Input.Keyboard" )
+			if ( text::equals ( category, L"Input.Keyboard" ) )
 				return battery::Kind::keyboard;
-			if ( category == L"Input.Mouse" )
+			if ( text::equals ( category, L"Input.Mouse" ) )
 				return battery::Kind::mouse;
-			if ( category == L"Input.Gaming" )
+			if ( text::equals ( category, L"Input.Gaming" ) )
 				return battery::Kind::gamepad;
-			if ( category.starts_with ( L"Input." ) )
+			if ( text::startsWith ( category, L"Input." ) )
 				return battery::Kind::other;
 		}
 
 		return std::nullopt;
-	}
-
-	std::wstring friendlyName ( DEVINST node, const wchar_t* fallback )
-	{
-		auto	name = std::array<wchar_t, 256> {};
-		if ( ! property ( node, DEVPKEY_Device_FriendlyName, DEVPROP_TYPE_STRING, name ) )
-			return fallback;
-
-		return name.data ();
 	}
 
 	void unwatchRadio ()
@@ -214,31 +222,42 @@ bool battery::onDeviceChange ( HWND window, WPARAM wParam, LPARAM lParam )
 	return false;
 }
 
-std::vector<battery::Device> battery::scan ()
+void battery::scan ( Devices& devices )
 {
-	auto	devices = std::vector<Device> {};
+	devices.count = 0;
 
 	// BTHLE = Bluetooth Low Energy, BTHENUM = classic Bluetooth (battery via hands-free profile)
 	for ( const auto* enumerator : { L"BTHLE", L"BTHENUM" } )
 	{
-		const auto	list = idList ( enumerator );
+		const auto	list = IdList ( enumerator );
+		if ( list.ids == nullptr )
+			continue;
 
-		for ( const auto id : strings ( list.data () ) )
+		for ( const auto* id = list.ids; *id != 0 && devices.count < maxDevices; id = text::next ( id ) )
 		{
 			auto	node = DEVINST ( 0 );
-			if ( CM_Locate_DevNodeW ( &node, const_cast<DEVINSTID_W> ( id.data () ), CM_LOCATE_DEVNODE_NORMAL ) != CR_SUCCESS )
+			if ( CM_Locate_DevNodeW ( &node, const_cast<DEVINSTID_W> ( id ), CM_LOCATE_DEVNODE_NORMAL ) != CR_SUCCESS )
 				continue;
 
 			const auto	percent = batteryLevel ( node );
 			if ( ! percent || ! isConnected ( node ) )
 				continue;
 
-			if ( const auto kind = inputKind ( node ) )
-				devices.push_back ( { std::wstring ( id ), friendlyName ( node, id.data () ), *kind, *percent } );
+			const auto	kind = inputKind ( node );
+			if ( ! kind )
+				continue;
+
+			auto&	device = devices.items[ devices.count++ ];
+			lstrcpynW ( device.id.data (), id, int ( device.id.size () ) );
+			if ( ! property ( node, DEVPKEY_Device_FriendlyName, DEVPROP_TYPE_STRING, device.name ) )
+				lstrcpynW ( device.name.data (), id, int ( device.name.size () ) );
+
+			device.kind = *kind;
+			device.percent = *percent;
 		}
 	}
 
-	std::ranges::sort ( devices, {}, &Device::name );
-	return devices;
+	std::ranges::sort ( devices.items.data (), devices.items.data () + devices.count,
+						[] ( const Device& a, const Device& b ) { return text::less ( a.name.data (), b.name.data () ); } );
 }
 //-----------------------------------------------------------------------------

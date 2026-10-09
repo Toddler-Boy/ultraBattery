@@ -1,6 +1,6 @@
 #include <algorithm>
-#include <string>
-#include <vector>
+#include <array>
+#include <span>
 
 #include <windows.h>
 #include <shellapi.h>
@@ -9,6 +9,7 @@
 #include "Autostart.h"
 #include "Battery.h"
 #include "GUI_BatteryIcon.h"
+#include "Text.h"
 
 //-----------------------------------------------------------------------------
 
@@ -25,19 +26,33 @@ namespace
 
 	struct TrayEntry
 	{
-		std::wstring	id;
-		UINT			uid = 0;
-		int				percent = -1;
+		std::array<wchar_t, MAX_DEVICE_ID_LEN>	id;
+		UINT									uid;
+		int										percent;	// -1 = not shown
 	};
 
-	auto	entries = std::vector<TrayEntry> {};
+	auto	devices = battery::Devices {};
+	auto	entries = std::array<TrayEntry, battery::maxDevices> {};
+	auto	entryCount = 0;
 	auto	taskbarCreated = UINT ( 0 );
+
+	std::span<TrayEntry> trayEntries ()
+	{
+		return { entries.data (), size_t ( entryCount ) };
+	}
+
+	TrayEntry* findEntry ( const wchar_t* id )
+	{
+		const auto	list = trayEntries ();
+		const auto	it = std::ranges::find_if ( list, [ & ] ( const TrayEntry& entry ) { return text::equals ( entry.id.data (), id ); } );
+		return it != list.end () ? &*it : nullptr;
+	}
 
 	// Windows remembers "show on taskbar" per exe path and uid, so a reconnecting device reuses a known uid
 	UINT freeUid ()
 	{
 		auto	uid = UINT ( 1 );
-		while ( std::ranges::contains ( entries, uid, &TrayEntry::uid ) )
+		while ( std::ranges::contains ( trayEntries (), uid, &TrayEntry::uid ) )
 			++uid;
 		return uid;
 	}
@@ -67,7 +82,7 @@ namespace
 		data.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP | NIF_MESSAGE;
 		data.uCallbackMessage = trayMessage;
 		data.hIcon = batteryIcon::create ( device.percent, device.kind, iconSize, light );
-		wcsncpy_s ( data.szTip, ( device.name + L": " + std::to_wstring ( device.percent ) + L"%" ).c_str (), _TRUNCATE );
+		wsprintfW ( data.szTip, L"%.100s: %d%%", device.name.data (), device.percent );
 
 		auto	shown = Shell_NotifyIconW ( NIM_MODIFY, &data ) != FALSE;
 		if ( ! shown && Shell_NotifyIconW ( NIM_ADD, &data ) != FALSE )
@@ -89,28 +104,34 @@ namespace
 
 	void refresh ( HWND window, bool redraw )
 	{
-		const auto	devices = battery::scan ();
+		battery::scan ( devices );
 
-		std::erase_if ( entries, [ & ] ( const TrayEntry& entry )
+		auto	kept = 0;
+		for ( const auto& entry : trayEntries () )
 		{
-			if ( std::ranges::contains ( devices, entry.id, &battery::Device::id ) )
-				return false;
+			if ( std::ranges::any_of ( devices.list (), [ & ] ( const battery::Device& device ) { return text::equals ( device.id.data (), entry.id.data () ); } ) )
+				entries[ kept++ ] = entry;
+			else
+				remove ( window, entry );
+		}
+		entryCount = kept;
 
-			remove ( window, entry );
-			return true;
-		} );
 
 		const auto	iconSize = GetSystemMetricsForDpi ( SM_CXSMICON, GetDpiForWindow ( window ) );
 		const auto	light = lightTaskbar ();
 
-		for ( const auto& device : devices )
+		for ( const auto& device : devices.list () )
 		{
-			auto	it = std::ranges::find ( entries, device.id, &TrayEntry::id );
-			if ( it == entries.end () )
-				it = entries.insert ( entries.end (), { device.id, freeUid () } );
+			auto*	entry = findEntry ( device.id.data () );
+			if ( entry == nullptr )
+			{
+				const auto	uid = freeUid ();
+				entry = &entries[ entryCount++ ];
+				*entry = { device.id, uid, -1 };
+			}
 
-			if ( redraw || it->percent != device.percent )
-				show ( window, *it, device, iconSize, light );
+			if ( redraw || entry->percent != device.percent )
+				show ( window, *entry, device, iconSize, light );
 		}
 	}
 
@@ -161,7 +182,7 @@ namespace
 				return TRUE;
 
 			case WM_SETTINGCHANGE:
-				if ( lParam != 0 && wcscmp ( reinterpret_cast<const wchar_t*> ( lParam ), L"ImmersiveColorSet" ) == 0 )
+				if ( lParam != 0 && text::equals ( reinterpret_cast<const wchar_t*> ( lParam ), L"ImmersiveColorSet" ) )
 					refresh ( window, true );
 				return 0;
 
@@ -176,7 +197,7 @@ namespace
 				return 0;
 
 			case WM_DESTROY:
-				for ( const auto& entry : entries )
+				for ( const auto& entry : trayEntries () )
 					remove ( window, entry );
 				PostQuitMessage ( 0 );
 				return 0;
@@ -184,38 +205,46 @@ namespace
 
 		return DefWindowProcW ( window, message, wParam, lParam );
 	}
+
+	int run ()
+	{
+		CreateMutexW ( nullptr, FALSE, L"ultraBattery" );
+		if ( GetLastError () == ERROR_ALREADY_EXISTS )
+			return 0;
+
+		autostart::initialise ();
+		SetProcessDpiAwarenessContext ( DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 );
+		taskbarCreated = RegisterWindowMessageW ( L"TaskbarCreated" );
+
+		const auto	instance = GetModuleHandleW ( nullptr );
+
+		auto	windowClass = WNDCLASSW {};
+		windowClass.lpfnWndProc = windowProc;
+		windowClass.hInstance = instance;
+		windowClass.lpszClassName = L"ultraBattery";
+		RegisterClassW ( &windowClass );
+
+		// A hidden top-level window, message-only windows miss the TaskbarCreated broadcast
+		const auto	window = CreateWindowExW ( 0, windowClass.lpszClassName, L"ultraBattery", WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr );
+		if ( window == nullptr )
+			return 1;
+
+		battery::watchConnections ( window );
+		refresh ( window, true );
+		SetTimer ( window, pollTimer, pollMilliseconds, nullptr );
+
+		auto	message = MSG {};
+		while ( GetMessageW ( &message, nullptr, 0, 0 ) > 0 )
+			DispatchMessageW ( &message );
+
+		return 0;
+	}
 }
 //-----------------------------------------------------------------------------
 
-int WINAPI wWinMain ( HINSTANCE instance, HINSTANCE, PWSTR, int )
+// The linker's entry point (/ENTRY), there is no C runtime to call a WinMain
+extern "C" void entry ()
 {
-	CreateMutexW ( nullptr, FALSE, L"ultraBattery" );
-	if ( GetLastError () == ERROR_ALREADY_EXISTS )
-		return 0;
-
-	autostart::initialise ();
-	SetProcessDpiAwarenessContext ( DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 );
-	taskbarCreated = RegisterWindowMessageW ( L"TaskbarCreated" );
-
-	auto	windowClass = WNDCLASSW {};
-	windowClass.lpfnWndProc = windowProc;
-	windowClass.hInstance = instance;
-	windowClass.lpszClassName = L"ultraBattery";
-	RegisterClassW ( &windowClass );
-
-	// A hidden top-level window, message-only windows miss the TaskbarCreated broadcast
-	const auto	window = CreateWindowExW ( 0, windowClass.lpszClassName, L"ultraBattery", WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr );
-	if ( window == nullptr )
-		return 1;
-
-	battery::watchConnections ( window );
-	refresh ( window, true );
-	SetTimer ( window, pollTimer, pollMilliseconds, nullptr );
-
-	auto	message = MSG {};
-	while ( GetMessageW ( &message, nullptr, 0, 0 ) > 0 )
-		DispatchMessageW ( &message );
-
-	return 0;
+	ExitProcess ( UINT ( run () ) );
 }
 //-----------------------------------------------------------------------------

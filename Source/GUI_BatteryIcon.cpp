@@ -1,11 +1,8 @@
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <span>
-#include <string>
-#include <vector>
 
 #include "GUI_BatteryIcon.h"
 
@@ -23,6 +20,20 @@ namespace
 		uint32_t*	pixels = nullptr;
 	};
 
+	// The icon's colour bitmap, everything is drawn straight into it
+	struct Target
+	{
+		uint32_t*	pixels = nullptr;
+		int			size = 0;
+		uint32_t	rgb = 0;
+
+		void put ( int x, int y, uint32_t alpha ) const
+		{
+			if ( alpha != 0 )
+				pixels[ y * size + x ] = ( alpha << 24 ) | rgb;
+		}
+	};
+
 	Dib createDib ( int width, int height )
 	{
 		auto	info = BITMAPINFO {};
@@ -36,6 +47,12 @@ namespace
 		auto		bits = static_cast<void*> ( nullptr );
 		const auto	bitmap = CreateDIBSection ( nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0 );
 		return { bitmap, static_cast<uint32_t*> ( bits ) };
+	}
+
+	// Positive values only
+	int roundToInt ( float value )
+	{
+		return int ( value + 0.5f );
 	}
 
 	uint32_t textColour ( int percent, bool lightTaskbar )
@@ -99,17 +116,15 @@ namespace
 		return std::nullopt;
 	}
 
-	struct Ink
+	// The largest rendering whose inked pixels fit the band, centred in it
+	void drawNumber ( const Target& target, int percent, RECT band )
 	{
-		std::vector<uint8_t>	alpha;
-		int						width = 0;
-		int						height = 0;
-	};
+		auto	text = std::array<wchar_t, 8> {};
+		const auto	length = wsprintfW ( text.data (), L"%d", percent );
 
-	// The largest rendering of text whose inked pixels fit maxWidth x maxHeight, cropped to them
-	Ink render ( const std::wstring& text, const wchar_t* face, int weight, int maxWidth, int maxHeight )
-	{
 		// Rendered white on black, the grey levels become alpha
+		const auto	maxWidth = int ( band.right - band.left );
+		const auto	maxHeight = int ( band.bottom - band.top );
 		const auto	scratchSize = std::max ( maxWidth, maxHeight ) * 2;
 		const auto	scratch = createDib ( scratchSize, scratchSize );
 		const auto	dc = CreateCompatibleDC ( nullptr );
@@ -118,64 +133,61 @@ namespace
 		SetTextColor ( dc, RGB ( 255, 255, 255 ) );
 		SetBkMode ( dc, TRANSPARENT );
 
-		auto	bounds = RECT {};
+		auto	ink = RECT {};
 		for ( auto em = scratchSize; em > 4; --em )
 		{
 			std::fill_n ( scratch.pixels, scratchSize * scratchSize, 0u );
 
-			const auto	font = CreateFontW ( -em, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-											 ANTIALIASED_QUALITY, DEFAULT_PITCH, face );
+			const auto	font = CreateFontW ( -em, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+											 ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI" );
 			const auto	oldFont = SelectObject ( dc, font );
-			TextOutW ( dc, 0, 0, text.c_str (), int ( text.size () ) );
+			TextOutW ( dc, 0, 0, text.data (), length );
 			SelectObject ( dc, oldFont );
 			DeleteObject ( font );
 			GdiFlush ();
 
-			bounds = { scratchSize, scratchSize, 0, 0 };
+			ink = { scratchSize, scratchSize, 0, 0 };
 			for ( auto y = 0; y < scratchSize; ++y )
 				for ( auto x = 0; x < scratchSize; ++x )
 					if ( ( scratch.pixels[ y * scratchSize + x ] & 0xFF ) != 0 )
-						bounds = { std::min ( bounds.left, LONG ( x ) ), std::min ( bounds.top, LONG ( y ) ),
-								   std::max ( bounds.right, LONG ( x + 1 ) ), std::max ( bounds.bottom, LONG ( y + 1 ) ) };
+						ink = { std::min ( ink.left, LONG ( x ) ), std::min ( ink.top, LONG ( y ) ),
+								std::max ( ink.right, LONG ( x + 1 ) ), std::max ( ink.bottom, LONG ( y + 1 ) ) };
 
-			if ( bounds.right - bounds.left <= maxWidth && bounds.bottom - bounds.top <= maxHeight )
+			if ( ink.right - ink.left <= maxWidth && ink.bottom - ink.top <= maxHeight )
 				break;
 		}
 
 		SelectObject ( dc, oldBitmap );
 		DeleteDC ( dc );
 
-		auto	ink = Ink {};
-		ink.width = std::max ( 0, int ( bounds.right - bounds.left ) );
-		ink.height = std::max ( 0, int ( bounds.bottom - bounds.top ) );
-		ink.alpha.resize ( ink.width * ink.height );
+		const auto	offsetX = band.left + ( maxWidth - ( ink.right - ink.left ) ) / 2 - ink.left;
+		const auto	offsetY = band.top + ( maxHeight - ( ink.bottom - ink.top ) ) / 2 - ink.top;
 
-		for ( auto y = 0; y < ink.height; ++y )
-			for ( auto x = 0; x < ink.width; ++x )
-				ink.alpha[ y * ink.width + x ] = uint8_t ( scratch.pixels[ ( y + bounds.top ) * scratchSize + x + bounds.left ] & 0xFF );
+		for ( auto y = ink.top; y < ink.bottom; ++y )
+			for ( auto x = ink.left; x < ink.right; ++x )
+				target.put ( x + offsetX, y + offsetY, scratch.pixels[ y * scratchSize + x ] & 0xFF );
 
 		DeleteObject ( scratch.bitmap );
-		return ink;
 	}
 
-	// The design as large as fits maxWidth x maxHeight, its edges anti-aliased by supersampling
-	Ink paint ( const Design& design, int maxWidth, int maxHeight )
+	// The design as large as fits the band, centred in it, its edges anti-aliased by supersampling
+	void drawDesign ( const Target& target, const Design& design, RECT band )
 	{
 		constexpr auto	supersample = 4;
 
+		const auto	maxWidth = int ( band.right - band.left );
+		const auto	maxHeight = int ( band.bottom - band.top );
 		const auto	scale = std::min ( float ( maxWidth ) / design.width, float ( maxHeight ) / design.height );
-		auto		ink = Ink {};
-		ink.width = int ( std::lround ( design.width * scale ) );
-		ink.height = int ( std::lround ( design.height * scale ) );
+		const auto	width = roundToInt ( design.width * scale );
+		const auto	height = roundToInt ( design.height * scale );
 
-		const auto	scratchWidth = ink.width * supersample;
-		const auto	scratchHeight = ink.height * supersample;
-		const auto	scratch = createDib ( scratchWidth, scratchHeight );
+		const auto	scratchWidth = width * supersample;
+		const auto	scratch = createDib ( scratchWidth, height * supersample );
 		const auto	dc = CreateCompatibleDC ( nullptr );
 		const auto	oldBitmap = SelectObject ( dc, scratch.bitmap );
 		const auto	oldPen = SelectObject ( dc, GetStockObject ( NULL_PEN ) );
 		const auto	oldBrush = SelectObject ( dc, GetStockObject ( WHITE_BRUSH ) );
-		const auto	toScratch = [ & ] ( float units ) { return int ( std::lround ( units * scale * supersample ) ); };
+		const auto	toScratch = [ & ] ( float units ) { return roundToInt ( units * scale * supersample ); };
 
 		// A null pen leaves out the right and bottom edge, hence the + 1
 		for ( const auto& part : design.parts )
@@ -191,28 +203,21 @@ namespace
 		SelectObject ( dc, oldBitmap );
 		DeleteDC ( dc );
 
-		ink.alpha.resize ( ink.width * ink.height );
-		for ( auto y = 0; y < ink.height; ++y )
-			for ( auto x = 0; x < ink.width; ++x )
+		const auto	left = band.left + ( maxWidth - width ) / 2;
+		const auto	top = band.top + ( maxHeight - height ) / 2;
+
+		for ( auto y = 0; y < height; ++y )
+			for ( auto x = 0; x < width; ++x )
 			{
 				auto	sum = 0u;
 				for ( auto sy = 0; sy < supersample; ++sy )
 					for ( auto sx = 0; sx < supersample; ++sx )
 						sum += scratch.pixels[ ( y * supersample + sy ) * scratchWidth + x * supersample + sx ] & 0xFF;
 
-				ink.alpha[ y * ink.width + x ] = uint8_t ( sum / ( supersample * supersample ) );
+				target.put ( left + x, top + y, sum / ( supersample * supersample ) );
 			}
 
 		DeleteObject ( scratch.bitmap );
-		return ink;
-	}
-
-	void draw ( const Ink& ink, uint32_t* pixels, int size, int left, int top, uint32_t rgb )
-	{
-		for ( auto y = 0; y < ink.height; ++y )
-			for ( auto x = 0; x < ink.width; ++x )
-				if ( const auto alpha = uint32_t ( ink.alpha[ y * ink.width + x ] ); alpha != 0 )
-					pixels[ ( y + top ) * size + x + left ] = ( alpha << 24 ) | rgb;
 	}
 }
 //-----------------------------------------------------------------------------
@@ -220,25 +225,23 @@ namespace
 HICON batteryIcon::create ( int percent, battery::Kind kind, int size, bool lightTaskbar )
 {
 	const auto	colour = createDib ( size, size );
-	const auto	rgb = textColour ( percent, lightTaskbar );
+	const auto	target = Target { colour.pixels, size, textColour ( percent, lightTaskbar ) };
 	const auto	symbol = design ( kind );
 	const auto	symbolHeight = symbol ? size * 9 / 16 - 1 : 0;
 	const auto	gap = symbol ? symbolGap : 0;
 	const auto	numberHeight = size - symbolHeight - gap;
 
-	const auto	number = render ( std::to_wstring ( percent ), L"Segoe UI", FW_BOLD, size, numberHeight );
-	draw ( number, colour.pixels, size, ( size - number.width ) / 2, ( numberHeight - number.height ) / 2, rgb );
+	drawNumber ( target, percent, { 0, 0, size, numberHeight } );
 
 	if ( symbol )
-	{
-		const auto	bandTop = numberHeight + gap + symbol->topInset;
-		const auto	bandHeight = symbolHeight - symbol->topInset;
-		const auto	device = paint ( *symbol, size, bandHeight );
-		draw ( device, colour.pixels, size, ( size - device.width ) / 2, bandTop + ( bandHeight - device.height ) / 2, rgb );
-	}
+		drawDesign ( target, *symbol, { 0, numberHeight + gap + symbol->topInset, size, size } );
 
-	const auto	opaque = std::vector<uint8_t> ( ( size + 15 ) / 16 * 2 * size, 0 );
-	const auto	mask = CreateBitmap ( size, size, 1, 1, opaque.data () );
+	// An all-zero mask: the colour bitmap's alpha decides
+	const auto	maskBytes = SIZE_T ( ( size + 15 ) / 16 * 2 * size );
+	const auto	maskBits = HeapAlloc ( GetProcessHeap (), HEAP_ZERO_MEMORY, maskBytes );
+	const auto	mask = CreateBitmap ( size, size, 1, 1, maskBits );
+	HeapFree ( GetProcessHeap (), 0, maskBits );
+
 	auto		info = ICONINFO { TRUE, 0, 0, mask, colour.bitmap };
 	const auto	icon = CreateIconIndirect ( &info );
 

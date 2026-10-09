@@ -1,4 +1,4 @@
-#include <string>
+#include <array>
 
 #include <windows.h>
 
@@ -11,13 +11,6 @@ namespace
 	constexpr auto	runKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 	constexpr auto	appKey = L"Software\\ultraBattery";
 	constexpr auto	valueName = L"ultraBattery";
-
-	std::wstring command ()
-	{
-		auto	path = std::wstring ( 32768, L'\0' );
-		path.resize ( GetModuleFileNameW ( nullptr, path.data (), DWORD ( path.size () ) ) );
-		return L"\"" + path + L"\"";
-	}
 }
 //-----------------------------------------------------------------------------
 
@@ -47,7 +40,11 @@ void autostart::setEnabled ( bool enabled )
 		return;
 	}
 
-	const auto	value = command ();
-	RegSetKeyValueW ( HKEY_CURRENT_USER, runKey, valueName, REG_SZ, value.c_str (), DWORD ( ( value.size () + 1 ) * sizeof ( wchar_t ) ) );
+	auto		command = std::array<wchar_t, MAX_PATH * 4> {};
+	const auto	length = GetModuleFileNameW ( nullptr, command.data () + 1, DWORD ( command.size () - 2 ) );
+	command[ 0 ] = L'"';
+	command[ length + 1 ] = L'"';
+
+	RegSetKeyValueW ( HKEY_CURRENT_USER, runKey, valueName, REG_SZ, command.data (), DWORD ( ( length + 3 ) * sizeof ( wchar_t ) ) );
 }
 //-----------------------------------------------------------------------------

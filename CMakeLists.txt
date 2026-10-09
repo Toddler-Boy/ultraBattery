@@ -1,8 +1,11 @@
 cmake_minimum_required (VERSION 4.2.0 FATAL_ERROR)
 
-set (CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+# No C runtime at all: own entry point, no default libraries, nothing that needs CRT support
+# (security cookies, runtime checks, thread-safe statics, iterator debugging)
+set (CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 set (CMAKE_CONFIGURATION_TYPES Debug Release)
 
+set (CMAKE_CXX_FLAGS_DEBUG "/Od /Zi /GS-")
 set (CMAKE_CXX_FLAGS_RELEASE "/O1 /Ob1 /clang:-Oz /GF /GS- /Gy /Gw /DNDEBUG")
 set (CMAKE_EXE_LINKER_FLAGS_RELEASE "/INCREMENTAL:NO /OPT:REF /OPT:ICF /DEBUG:NONE")
 
@@ -27,9 +30,14 @@ add_executable (ultraBattery WIN32
 	Source/Battery.h
 	Source/GUI_BatteryIcon.cpp
 	Source/GUI_BatteryIcon.h
-	Source/Main.cpp)
+	Source/Main.cpp
+	Source/NoCrt.cpp
+	Source/Text.h)
+
+set_source_files_properties (Source/NoCrt.cpp PROPERTIES COMPILE_OPTIONS "/clang:-fno-builtin")
 
 target_compile_definitions (ultraBattery PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _HAS_EXCEPTIONS=0 APP_VERSION="${VERSION}")
-target_compile_options (ultraBattery PRIVATE /EHs-c-)
-target_link_libraries (ultraBattery PRIVATE advapi32 bthprops cfgmgr32 shell32 gdi32 user32)
+target_compile_options (ultraBattery PRIVATE /EHs-c- /Zc:threadSafeInit-)
+target_link_options (ultraBattery PRIVATE /NODEFAULTLIB /ENTRY:entry)
+target_link_libraries (ultraBattery PRIVATE kernel32 advapi32 bthprops cfgmgr32 shell32 gdi32 user32)
 set_property (DIRECTORY PROPERTY VS_STARTUP_PROJECT ultraBattery)

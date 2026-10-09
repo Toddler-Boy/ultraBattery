@@ -12,12 +12,11 @@ Every connected device gets its own tray icon: the battery percentage on top, a 
 - Orange at 30% and below, red at 15% and below
 - Follows the light or dark taskbar theme and the display scaling
 - Optional start with Windows (right-click menu)
-- About 45 KB, no installer, no settings files
+- About 31 KB, no installer, no runtime, no settings files
 
 ## Requirements
 
 - Windows 10 or 11
-- Microsoft Visual C++ Redistributable (x64)
 - Bluetooth devices that report their battery level to Windows (Bluetooth LE battery service). If Windows shows a battery level for the device under Settings, Bluetooth & devices, ultraBattery shows it too.
 
 ## Usage

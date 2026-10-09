@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.0 (2026-10-09)
+
+- No longer needs the Microsoft Visual C++ Redistributable
+- The download shrank from 60 KB to about 31 KB
+
 ## 1.0.0 (2026-10-08)
 
 First release.
