@@ -1,0 +1,25 @@
+{
+	"cmakeMinimumRequired": {
+		"major": 4,
+		"minor": 2,
+		"patch": 0
+	},
+	"version": 10,
+	"configurePresets": [
+		{
+			"name": "vs",
+			"displayName": "Build with Visual Studio",
+			"generator": "Visual Studio 18 2026",
+			"toolset": "ClangCL",
+			"binaryDir": "${sourceDir}/Builds/${presetName}"
+		}
+	],
+	"buildPresets": [
+		{
+			"name": "vs",
+			"displayName": "Build with Visual Studio",
+			"configurePreset": "vs",
+			"configuration": "Release"
+		}
+	]
+}

@@ -1,0 +1,88 @@
+name: Build
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and release
+    runs-on: windows-2025-vs2026
+    # contents: write for creating the release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # A mistyped tag or a missing changelog section would publish a wrong or empty release
+      - name: Check tag matches VERSION and CHANGELOG
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          ver=$(tr -d ' \r\n' < VERSION)
+          tag="${GITHUB_REF#refs/tags/}"
+          if [ "v$ver" != "$tag" ]; then
+            echo "Tag $tag does not match VERSION file ($ver)"
+            exit 1
+          fi
+          if ! grep -q "^## $ver\( \|$\)" CHANGELOG.md; then
+            echo "CHANGELOG.md has no section for $ver"
+            exit 1
+          fi
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake --preset vs
+          cmake --build --preset vs --config Release
+
+      # Azure Trusted Signing, same account and certificate profile as ultraSID.
+      # signtool's Azure credential reads the AZURE_TENANT_ID/CLIENT_ID/CLIENT_SECRET variables
+      - name: Sign exe
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+          AZURE_ACCOUNT_NAME: ${{ secrets.AZURE_ACCOUNT_NAME }}
+          AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
+        run: |
+          signtool=$(ls -1 "/c/Program Files (x86)/Windows Kits/10/bin/"*/x64/signtool.exe | sort | tail -1)
+          nuget install Microsoft.Trusted.Signing.Client -Version 1.0.86 -OutputDirectory "$RUNNER_TEMP/signing" -ExcludeVersion -NonInteractive
+
+          cat > "$RUNNER_TEMP/metadata.json" <<EOF
+          {
+            "Endpoint": "$AZURE_ENDPOINT",
+            "CodeSigningAccountName": "$AZURE_ACCOUNT_NAME",
+            "CertificateProfileName": "$AZURE_CERT_PROFILE"
+          }
+          EOF
+
+          "$signtool" sign -v -fd SHA256 -tr "http://timestamp.acs.microsoft.com" -td SHA256 \
+            -dlib "$RUNNER_TEMP/signing/Microsoft.Trusted.Signing.Client/bin/x64/Azure.CodeSigning.Dlib.dll" \
+            -dmdf "$RUNNER_TEMP/metadata.json" Builds/vs/Release/ultraBattery.exe
+
+      # Manual runs keep the exe as a run artifact, tag runs publish it
+      - name: Upload exe
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ultraBattery.exe
+          path: Builds/vs/Release/ultraBattery.exe
+          if-no-files-found: error
+          archive: false
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver=$(tr -d ' \r\n' < VERSION)
+          tag="${GITHUB_REF#refs/tags/}"
+
+          # Release notes = this version's CHANGELOG section only
+          awk -v ver="$ver" '/^## /{p = ($2 == ver)} p && !/^## /' CHANGELOG.md > notes.md
+          gh release create "$tag" Builds/vs/Release/ultraBattery.exe --title "ultraBattery $ver" --notes-file notes.md
