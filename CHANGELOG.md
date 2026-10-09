@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.0 (2026-10-09)
+
+- Battery level for controllers in Nintendo Switch mode over Bluetooth (Switch Pro protocol, for example 8BitDo controllers). These only report five steps, shown as 100, 66, 30, 5 and 0%
+
 ## 1.1.0 (2026-10-09)
 
 - No longer needs the Microsoft Visual C++ Redistributable

@@ -24,6 +24,17 @@ namespace text
 		return lstrlenW ( text ) >= length && CompareStringOrdinal ( text, length, prefix, length, FALSE ) == CSTR_EQUAL;
 	}
 
+	// Ignores case, device IDs come back in mixed case
+	inline bool contains ( const wchar_t* text, const wchar_t* part )
+	{
+		const auto	length = lstrlenW ( part );
+		for ( auto rest = lstrlenW ( text ); rest >= length; --rest, ++text )
+			if ( CompareStringOrdinal ( text, length, part, length, TRUE ) == CSTR_EQUAL )
+				return true;
+
+		return false;
+	}
+
 	// Steps through a REG_MULTI_SZ style list: strings separated by one zero, ended by two
 	inline const wchar_t* next ( const wchar_t* item )
 	{

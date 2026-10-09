@@ -11,6 +11,7 @@
 #include <cfgmgr32.h>
 #include <dbt.h>
 #include <devpkey.h>
+#include <hidclass.h>
 
 #include "Battery.h"
 #include "Text.h"
@@ -148,6 +149,93 @@ namespace
 		return std::nullopt;
 	}
 
+	// Nintendo Switch Pro Controller protocol (8BitDo controllers in Switch mode use it too). The level
+	// only arrives inside replies, so a harmless "request device info" subcommand is sent to get one
+	constexpr auto	switchHardwareId = L"_VID&0002057E_PID&2009";
+	constexpr auto	switchOutputLength = 49;
+	constexpr auto	switchReplyTimeout = ULONGLONG ( 1000 );
+
+	auto	switchPacketCounter = BYTE ( 0 );
+
+	std::optional<int> querySwitchController ( const wchar_t* interfacePath )
+	{
+		const auto	device = CreateFileW ( interfacePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+										   FILE_FLAG_OVERLAPPED, nullptr );
+		if ( device == INVALID_HANDLE_VALUE )
+			return std::nullopt;
+
+		const auto	event = CreateEventW ( nullptr, TRUE, FALSE, nullptr );
+		auto		overlapped = OVERLAPPED {};
+		overlapped.hEvent = event;
+
+		// Output report 0x01: packet counter, neutral rumble, subcommand 0x02
+		auto	request = std::array<BYTE, switchOutputLength> { 0x01, BYTE ( switchPacketCounter++ & 0x0F ), 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40, 0x02 };
+		auto	transferred = DWORD ( 0 );
+		auto	sent = WriteFile ( device, request.data (), DWORD ( request.size () ), nullptr, &overlapped ) != FALSE
+					   || ( GetLastError () == ERROR_IO_PENDING && GetOverlappedResult ( device, &overlapped, &transferred, TRUE ) != FALSE );
+
+		// Reply report 0x21: byte 2 holds the level in its top three bits (0 empty .. 4 full)
+		constexpr auto	percentForLevel = std::array { 0, 5, 30, 66, 100 };
+
+		auto		level = std::optional<int> {};
+		auto		report = std::array<BYTE, 512> {};
+		const auto	deadline = GetTickCount64 () + switchReplyTimeout;
+
+		while ( sent && ! level && GetTickCount64 () < deadline )
+		{
+			ResetEvent ( event );
+			if ( ReadFile ( device, report.data (), DWORD ( report.size () ), nullptr, &overlapped ) == FALSE && GetLastError () != ERROR_IO_PENDING )
+				break;
+
+			if ( WaitForSingleObject ( event, DWORD ( deadline - GetTickCount64 () ) ) != WAIT_OBJECT_0 )
+			{
+				CancelIo ( device );
+				GetOverlappedResult ( device, &overlapped, &transferred, TRUE );
+				break;
+			}
+
+			if ( GetOverlappedResult ( device, &overlapped, &transferred, FALSE ) != FALSE && transferred > 2 && report[ 0 ] == 0x21 )
+				level = percentForLevel[ std::min ( report[ 2 ] >> 5, 4 ) ];
+		}
+
+		CloseHandle ( event );
+		CloseHandle ( device );
+		return level;
+	}
+
+	// The controller's HID interface shares the Bluetooth device's container
+	std::optional<int> switchControllerLevel ( DEVINST bluetoothNode )
+	{
+		auto	container = GUID {};
+		if ( ! property ( bluetoothNode, DEVPKEY_Device_ContainerId, DEVPROP_TYPE_GUID, container ) )
+			return std::nullopt;
+
+		const auto	list = IdList ( L"HID" );
+		if ( list.ids == nullptr )
+			return std::nullopt;
+
+		for ( const auto* id = list.ids; *id != 0; id = text::next ( id ) )
+		{
+			if ( ! text::contains ( id, switchHardwareId ) )
+				continue;
+
+			auto	node = DEVINST ( 0 );
+			auto	nodeContainer = GUID {};
+			if ( CM_Locate_DevNodeW ( &node, const_cast<DEVINSTID_W> ( id ), CM_LOCATE_DEVNODE_NORMAL ) != CR_SUCCESS
+				 || ! property ( node, DEVPKEY_Device_ContainerId, DEVPROP_TYPE_GUID, nodeContainer ) || nodeContainer != container )
+				continue;
+
+			auto	interfaces = std::array<wchar_t, 512> {};
+			if ( CM_Get_Device_Interface_ListW ( const_cast<GUID*> ( &GUID_DEVINTERFACE_HID ), const_cast<DEVINSTID_W> ( id ), interfaces.data (),
+												 ULONG ( interfaces.size () - 1 ), CM_GET_DEVICE_INTERFACE_LIST_PRESENT ) != CR_SUCCESS || interfaces[ 0 ] == 0 )
+				continue;
+
+			return querySwitchController ( interfaces.data () );
+		}
+
+		return std::nullopt;
+	}
+
 	void unwatchRadio ()
 	{
 		if ( radioNotification != nullptr )
@@ -239,12 +327,17 @@ void battery::scan ( Devices& devices )
 			if ( CM_Locate_DevNodeW ( &node, const_cast<DEVINSTID_W> ( id ), CM_LOCATE_DEVNODE_NORMAL ) != CR_SUCCESS )
 				continue;
 
-			const auto	percent = batteryLevel ( node );
-			if ( ! percent || ! isConnected ( node ) )
+			if ( ! isConnected ( node ) )
 				continue;
 
 			const auto	kind = inputKind ( node );
 			if ( ! kind )
+				continue;
+
+			auto	percent = batteryLevel ( node );
+			if ( ! percent && *kind == Kind::gamepad )
+				percent = switchControllerLevel ( node );
+			if ( ! percent )
 				continue;
 
 			auto&	device = devices.items[ devices.count++ ];

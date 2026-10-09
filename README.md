@@ -7,6 +7,7 @@ Every connected device gets its own tray icon: the battery percentage on top, a 
 ## Features
 
 - One icon per connected Bluetooth input device (keyboard, mouse, gamepad), found automatically
+- Controllers in Nintendo Switch mode are read directly (Switch Pro protocol), in the five steps they report: 100, 66, 30, 5 and 0%
 - Icons appear and disappear within seconds when a device connects or disconnects
 - Battery level refreshed every 60 seconds
 - Orange at 30% and below, red at 15% and below
@@ -17,7 +18,8 @@ Every connected device gets its own tray icon: the battery percentage on top, a 
 ## Requirements
 
 - Windows 10 or 11
-- Bluetooth devices that report their battery level to Windows (Bluetooth LE battery service). If Windows shows a battery level for the device under Settings, Bluetooth & devices, ultraBattery shows it too.
+- Bluetooth devices that report their battery level to Windows (Bluetooth LE battery service). If Windows shows a battery level for the device under Settings, Bluetooth & devices, ultraBattery shows it too. Controllers in Switch mode are the exception, Windows shows nothing for them but ultraBattery does.
+- 2.4 GHz USB receivers are not supported, they don't pass the battery level on to Windows.
 
 ## Usage
 
