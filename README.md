@@ -8,6 +8,7 @@ Every connected device gets its own tray icon: the battery percentage on top, a 
 
 - One icon per connected Bluetooth input device (keyboard, mouse, gamepad), found automatically
 - Controllers in Nintendo Switch mode are read directly (Switch Pro protocol), in the five steps they report: 100, 66, 30, 5 and 0%
+- Joy-Cons and NES controllers charging in a Joy-Con Charging Grip on USB get an icon per rail, same five steps
 - Icons appear and disappear within seconds when a device connects or disconnects
 - Battery level refreshed every 60 seconds
 - Orange at 30% and below, red at 15% and below

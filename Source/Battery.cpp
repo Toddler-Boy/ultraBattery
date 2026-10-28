@@ -149,58 +149,120 @@ namespace
 		return std::nullopt;
 	}
 
-	// Nintendo Switch Pro Controller protocol (8BitDo controllers in Switch mode use it too). The level
-	// only arrives inside replies, so a harmless "request device info" subcommand is sent to get one
+	bool hidInterface ( const wchar_t* id, std::array<wchar_t, 512>& path )
+	{
+		return CM_Get_Device_Interface_ListW ( const_cast<GUID*> ( &GUID_DEVINTERFACE_HID ), const_cast<DEVINSTID_W> ( id ), path.data (),
+											   ULONG ( path.size () - 1 ), CM_GET_DEVICE_INTERFACE_LIST_PRESENT ) == CR_SUCCESS && path[ 0 ] != 0;
+	}
+
+	// Nintendo Switch Pro Controller protocol (8BitDo controllers in Switch mode and the Joy-Con Charging Grip use it too)
 	constexpr auto	switchHardwareId = L"_VID&0002057E_PID&2009";
-	constexpr auto	switchOutputLength = 49;
 	constexpr auto	switchReplyTimeout = ULONGLONG ( 1000 );
+	constexpr auto	switchStreamTimeout = ULONGLONG ( 100 );
 
 	auto	switchPacketCounter = BYTE ( 0 );
 
-	std::optional<int> querySwitchController ( const wchar_t* interfacePath )
+	struct SwitchDevice
 	{
-		const auto	device = CreateFileW ( interfacePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-										   FILE_FLAG_OVERLAPPED, nullptr );
-		if ( device == INVALID_HANDLE_VALUE )
-			return std::nullopt;
+		HANDLE		handle = INVALID_HANDLE_VALUE;
+		HANDLE		event = nullptr;
+		OVERLAPPED	overlapped = {};
 
-		const auto	event = CreateEventW ( nullptr, TRUE, FALSE, nullptr );
-		auto		overlapped = OVERLAPPED {};
-		overlapped.hEvent = event;
-
-		// Output report 0x01: packet counter, neutral rumble, subcommand 0x02
-		auto	request = std::array<BYTE, switchOutputLength> { 0x01, BYTE ( switchPacketCounter++ & 0x0F ), 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40, 0x02 };
-		auto	transferred = DWORD ( 0 );
-		auto	sent = WriteFile ( device, request.data (), DWORD ( request.size () ), nullptr, &overlapped ) != FALSE
-					   || ( GetLastError () == ERROR_IO_PENDING && GetOverlappedResult ( device, &overlapped, &transferred, TRUE ) != FALSE );
-
-		// Reply report 0x21: byte 2 holds the level in its top three bits (0 empty .. 4 full)
-		constexpr auto	percentForLevel = std::array { 0, 5, 30, 66, 100 };
-
-		auto		level = std::optional<int> {};
-		auto		report = std::array<BYTE, 512> {};
-		const auto	deadline = GetTickCount64 () + switchReplyTimeout;
-
-		while ( sent && ! level && GetTickCount64 () < deadline )
+		explicit SwitchDevice ( const wchar_t* interfacePath )
 		{
-			ResetEvent ( event );
-			if ( ReadFile ( device, report.data (), DWORD ( report.size () ), nullptr, &overlapped ) == FALSE && GetLastError () != ERROR_IO_PENDING )
-				break;
+			handle = CreateFileW ( interfacePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr );
+			if ( handle == INVALID_HANDLE_VALUE )
+				return;
 
-			if ( WaitForSingleObject ( event, DWORD ( deadline - GetTickCount64 () ) ) != WAIT_OBJECT_0 )
-			{
-				CancelIo ( device );
-				GetOverlappedResult ( device, &overlapped, &transferred, TRUE );
-				break;
-			}
-
-			if ( GetOverlappedResult ( device, &overlapped, &transferred, FALSE ) != FALSE && transferred > 2 && report[ 0 ] == 0x21 )
-				level = percentForLevel[ std::min ( report[ 2 ] >> 5, 4 ) ];
+			event = CreateEventW ( nullptr, TRUE, FALSE, nullptr );
+			overlapped.hEvent = event;
 		}
 
-		CloseHandle ( event );
-		CloseHandle ( device );
-		return level;
+		~SwitchDevice ()
+		{
+			if ( event != nullptr )
+				CloseHandle ( event );
+			if ( handle != INVALID_HANDLE_VALUE )
+				CloseHandle ( handle );
+		}
+
+		SwitchDevice ( const SwitchDevice& ) = delete;
+		SwitchDevice& operator= ( const SwitchDevice& ) = delete;
+
+		[[ nodiscard ]] bool isOpen () const { return handle != INVALID_HANDLE_VALUE; }
+
+		// USB wants exactly the output report length, Bluetooth 49 bytes
+		template <size_t length>
+		bool write ( const std::array<BYTE, length>& report )
+		{
+			auto	transferred = DWORD ( 0 );
+			return WriteFile ( handle, report.data (), DWORD ( report.size () ), nullptr, &overlapped ) != FALSE
+				   || ( GetLastError () == ERROR_IO_PENDING && GetOverlappedResult ( handle, &overlapped, &transferred, TRUE ) != FALSE );
+		}
+
+		// Reply report 0x21 and standard report 0x30: byte 2 holds the level in its top three bits (0 empty .. 4 full)
+		std::optional<int> readLevel ( ULONGLONG timeout )
+		{
+			constexpr auto	percentForLevel = std::array { 0, 5, 30, 66, 100 };
+
+			auto		level = std::optional<int> {};
+			auto		report = std::array<BYTE, 512> {};
+			auto		transferred = DWORD ( 0 );
+			const auto	deadline = GetTickCount64 () + timeout;
+
+			while ( ! level && GetTickCount64 () < deadline )
+			{
+				ResetEvent ( event );
+				if ( ReadFile ( handle, report.data (), DWORD ( report.size () ), nullptr, &overlapped ) == FALSE && GetLastError () != ERROR_IO_PENDING )
+					break;
+
+				if ( WaitForSingleObject ( event, DWORD ( deadline - GetTickCount64 () ) ) != WAIT_OBJECT_0 )
+				{
+					CancelIo ( handle );
+					GetOverlappedResult ( handle, &overlapped, &transferred, TRUE );
+					break;
+				}
+
+				if ( GetOverlappedResult ( handle, &overlapped, &transferred, FALSE ) != FALSE && transferred > 2 && ( report[ 0 ] == 0x21 || report[ 0 ] == 0x30 ) )
+					level = percentForLevel[ std::min ( report[ 2 ] >> 5, 4 ) ];
+			}
+
+			return level;
+		}
+	};
+
+	// Over Bluetooth the level only arrives inside replies, so a harmless "request device info" subcommand gets one
+	std::optional<int> switchBluetoothLevel ( const wchar_t* interfacePath )
+	{
+		auto	device = SwitchDevice ( interfacePath );
+		if ( ! device.isOpen () )
+			return std::nullopt;
+
+		// Output report 0x01: packet counter, neutral rumble, subcommand 0x02
+		const auto	info = std::array<BYTE, 49> { 0x01, BYTE ( switchPacketCounter++ & 0x0F ), 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40, 0x02 };
+		if ( ! device.write ( info ) )
+			return std::nullopt;
+
+		return device.readLevel ( switchReplyTimeout );
+	}
+
+	// A grip rail streams standard reports on its own. A controller put in after the grip was plugged in sleeps until
+	// the USB handshake (0x80 0x02) and "USB only" (0x80 0x04) commands, an empty rail stays silent either way
+	std::optional<int> switchUsbLevel ( const wchar_t* interfacePath )
+	{
+		auto	device = SwitchDevice ( interfacePath );
+		if ( ! device.isOpen () )
+			return std::nullopt;
+
+		auto	level = device.readLevel ( switchStreamTimeout );
+		if ( level )
+			return level;
+
+		for ( const auto command : { BYTE ( 0x02 ), BYTE ( 0x04 ) } )
+			if ( ! device.write ( std::array<BYTE, 64> { 0x80, command } ) )
+				return std::nullopt;
+
+		return device.readLevel ( switchReplyTimeout );
 	}
 
 	// The controller's HID interface shares the Bluetooth device's container
@@ -225,15 +287,99 @@ namespace
 				 || ! property ( node, DEVPKEY_Device_ContainerId, DEVPROP_TYPE_GUID, nodeContainer ) || nodeContainer != container )
 				continue;
 
-			auto	interfaces = std::array<wchar_t, 512> {};
-			if ( CM_Get_Device_Interface_ListW ( const_cast<GUID*> ( &GUID_DEVINTERFACE_HID ), const_cast<DEVINSTID_W> ( id ), interfaces.data (),
-												 ULONG ( interfaces.size () - 1 ), CM_GET_DEVICE_INTERFACE_LIST_PRESENT ) != CR_SUCCESS || interfaces[ 0 ] == 0 )
-				continue;
-
-			return querySwitchController ( interfaces.data () );
+			auto	path = std::array<wchar_t, 512> {};
+			if ( hidInterface ( id, path ) )
+				return switchBluetoothLevel ( path.data () );
 		}
 
 		return std::nullopt;
+	}
+
+	// Each rail of the grip is its own HID interface, interface 1 is the left rail. Nothing tells when a controller
+	// goes in or out, so a thread polls the rails and posts changedMessage
+	constexpr auto	gripHardwareId = L"VID_057E&PID_200E&MI_0";
+	constexpr auto	gripPollMilliseconds = DWORD ( 2000 );
+	constexpr auto	railNames = std::array { L"Joy-Con Charging Grip, left", L"Joy-Con Charging Grip, right" };
+
+	struct Rail
+	{
+		std::array<wchar_t, MAX_DEVICE_ID_LEN>	id;
+		int										percent;	// -1 = empty
+	};
+
+	auto	rails = std::array<Rail, railNames.size ()> {};
+	auto	railsLock = SRWLOCK {};
+	auto	gripWindow = HWND ( nullptr );
+
+	void readRails ( std::array<Rail, railNames.size ()>& found )
+	{
+		for ( auto& rail : found )
+			rail.percent = -1;
+
+		const auto	list = IdList ( L"HID" );
+		if ( list.ids == nullptr )
+			return;
+
+		for ( const auto* id = list.ids; *id != 0; id = text::next ( id ) )
+		{
+			if ( ! text::contains ( id, gripHardwareId ) )
+				continue;
+
+			auto	path = std::array<wchar_t, 512> {};
+			if ( ! hidInterface ( id, path ) )
+				continue;
+
+			const auto	percent = switchUsbLevel ( path.data () );
+			if ( ! percent )
+				continue;
+
+			auto&	rail = found[ text::contains ( id, L"&MI_01" ) ? 0 : 1 ];
+			lstrcpynW ( rail.id.data (), id, int ( rail.id.size () ) );
+			rail.percent = *percent;
+		}
+	}
+
+	DWORD WINAPI pollGrip ( void* )
+	{
+		SetThreadPriority ( GetCurrentThread (), THREAD_PRIORITY_BELOW_NORMAL );
+
+		for ( ;; )
+		{
+			auto	found = std::array<Rail, railNames.size ()> {};
+			readRails ( found );
+
+			AcquireSRWLockExclusive ( &railsLock );
+			auto	changed = false;
+			for ( auto index = size_t ( 0 ); index < found.size (); ++index )
+				changed |= found[ index ].percent != rails[ index ].percent || ! text::equals ( found[ index ].id.data (), rails[ index ].id.data () );
+			rails = found;
+			ReleaseSRWLockExclusive ( &railsLock );
+
+			if ( changed )
+				PostMessageW ( gripWindow, battery::changedMessage, 0, 0 );
+
+			Sleep ( gripPollMilliseconds );
+		}
+	}
+
+	void scanChargingGrip ( battery::Devices& devices )
+	{
+		AcquireSRWLockShared ( &railsLock );
+
+		for ( auto index = size_t ( 0 ); index < rails.size () && devices.count < battery::maxDevices; ++index )
+		{
+			const auto&	rail = rails[ index ];
+			if ( rail.percent < 0 )
+				continue;
+
+			auto&	device = devices.items[ devices.count++ ];
+			device.id = rail.id;
+			lstrcpynW ( device.name.data (), railNames[ index ], int ( device.name.size () ) );
+			device.kind = battery::Kind::gamepad;
+			device.percent = rail.percent;
+		}
+
+		ReleaseSRWLockShared ( &railsLock );
 	}
 
 	void unwatchRadio ()
@@ -270,14 +416,20 @@ namespace
 
 void battery::watchConnections ( HWND window )
 {
-	// A radio that arrives later (USB dongle plugged in, re-enumerated after sleep) shows up as this interface
-	auto	filter = DEV_BROADCAST_DEVICEINTERFACE_W {};
-	filter.dbcc_size = sizeof ( filter );
-	filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
-	filter.dbcc_classguid = GUID_BTHPORT_DEVICE_INTERFACE;
-	RegisterDeviceNotificationW ( window, &filter, DEVICE_NOTIFY_WINDOW_HANDLE );
+	// A radio that arrives later (USB dongle plugged in, re-enumerated after sleep) shows up as the first interface
+	for ( const auto& guid : { GUID_BTHPORT_DEVICE_INTERFACE, GUID_DEVINTERFACE_HID } )
+	{
+		auto	filter = DEV_BROADCAST_DEVICEINTERFACE_W {};
+		filter.dbcc_size = sizeof ( filter );
+		filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+		filter.dbcc_classguid = guid;
+		RegisterDeviceNotificationW ( window, &filter, DEVICE_NOTIFY_WINDOW_HANDLE );
+	}
 
 	watchRadio ( window );
+
+	gripWindow = window;
+	CreateThread ( nullptr, 0, pollGrip, nullptr, 0, nullptr );
 }
 
 bool battery::onDeviceChange ( HWND window, WPARAM wParam, LPARAM lParam )
@@ -286,10 +438,11 @@ bool battery::onDeviceChange ( HWND window, WPARAM wParam, LPARAM lParam )
 	if ( header == nullptr )
 		return false;
 
-	if ( header->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE && wParam == DBT_DEVICEARRIVAL )
+	if ( header->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE )
 	{
-		watchRadio ( window );
-		return true;
+		if ( wParam == DBT_DEVICEARRIVAL && reinterpret_cast<const DEV_BROADCAST_DEVICEINTERFACE_W*> ( header )->dbcc_classguid == GUID_BTHPORT_DEVICE_INTERFACE )
+			watchRadio ( window );
+		return wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE;
 	}
 
 	if ( header->dbch_devicetype != DBT_DEVTYP_HANDLE )
@@ -349,6 +502,8 @@ void battery::scan ( Devices& devices )
 			device.percent = *percent;
 		}
 	}
+
+	scanChargingGrip ( devices );
 
 	std::ranges::sort ( devices.items.data (), devices.items.data () + devices.count,
 						[] ( const Device& a, const Device& b ) { return text::less ( a.name.data (), b.name.data () ); } );

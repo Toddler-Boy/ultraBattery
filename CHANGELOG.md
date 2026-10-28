@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.0 (2026-10-28)
+
+- Battery level of Joy-Cons and NES controllers charging in a Joy-Con Charging Grip on USB, one icon per rail. Controllers put in or taken out show up within a few seconds
+
 ## 1.3.0 (2026-10-25)
 
 - The right-click menu follows the dark theme

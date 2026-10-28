@@ -202,6 +202,10 @@ namespace
 					SetTimer ( window, connectionTimer, connectionSettleMilliseconds, nullptr );
 				return TRUE;
 
+			case battery::changedMessage:
+				refresh ( window, false );
+				return 0;
+
 			case WM_SETTINGCHANGE:
 				if ( lParam != 0 && text::equals ( reinterpret_cast<const wchar_t*> ( lParam ), L"ImmersiveColorSet" ) )
 				{
